@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Convert to H5P</title>
+<style>
+  :root { --ink:#1f2933; --muted:#595959; --blue:#0148A4; --tint:#EDF2F9; --line:#BFBFBF; --bg:#ffffff; --bad:#B3261E; --ok:#2E7D32; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#E6E8EB; --muted:#A9AFB6; --blue:#7FB0FF; --tint:#1E2A3B; --line:#4A5159; --bg:#14171A; --bad:#FF8A80; --ok:#81C784; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 Calibri, Arial, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:40px 16px; }
+  h1 { margin:0 0 4px; color:var(--blue); font-size:30px; }
+  p { margin:0 0 16px; }
+  .muted { color:var(--muted); }
+  #drop { display:block; padding:44px 20px; text-align:center; border:2px dashed var(--line); border-radius:10px; background:var(--tint); cursor:pointer; }
+  #drop.over, #drop:focus-within { border-color:var(--blue); }
+  #drop strong { display:block; font-size:18px; }
+  input[type=file] { position:absolute; opacity:0; width:1px; height:1px; }
+  #result { margin-top:24px; }
+  button { font:inherit; font-weight:700; color:#fff; background:#0148A4; border:0; border-radius:6px; padding:10px 18px; cursor:pointer; }
+  .bad { color:var(--bad); font-weight:700; }
+  .ok { color:var(--ok); font-weight:700; }
+  ul { margin:6px 0 16px; padding-left:22px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Convert to H5P</h1>
+  <p class="muted">Turns a completed Word or PowerPoint lesson form into an H5P Course Presentation. Your file stays on this computer.</p>
+  <label id="drop">
+    <strong>Drop your .docx or .pptx here</strong>
+    <span class="muted">or click to choose a file</span>
+    <input id="file" type="file" accept=".docx,.pptx">
+  </label>
+  <div id="result" aria-live="polite"></div>
+</main>
+<script>
+"use strict";
+// Library versions. If an upload reports a version problem, change the numbers here.
+const LIB = { cp:"H5P.CoursePresentation 1.26", text:"H5P.AdvancedText 1.1", image:"H5P.Image 1.1",
+              video:"H5P.Video 1.6", mc:"H5P.MultiChoice 1.16", drag:"H5P.DragText 1.10" };
+const SLIDE_W = 9144000, SLIDE_H = 5143500;
+const QUESTION_KINDS = ["Multiple choice","True/False","Drag text","Put in order","Matching","Drag and drop"];
+const SLIDE_TAGS = ["Title","Retrieval","Hook","Contents","Segue","Video","Bridge","Summary","Close"];
+const COLOURS = { blue:"#0148A4", gold:"#FFB800", charcoal:"#414141", red:"#E64626" };
+
+class FormError extends Error {}
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const kids = (node, name) => [...node.children].filter(c => c.localName === name);
+const all = (node, name) => [...node.getElementsByTagNameNS("*", name)];
+const parseXml = text => new DOMParser().parseFromString(text, "application/xml");
+const relAttr = (el, name) => el.getAttribute("r:" + name) || el.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", name);
+const uuid = () => { const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = b[6] & 15 | 64; b[8] = b[8] & 63 | 128;
+  const h = [...b].map(x => x.toString(16).padStart(2,"0")).join(""); return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`; };
+
+/* ---------- zip ---------- */
+async function pipe(bytes, stream) {
+  const out = new Blob([bytes]).stream().pipeThrough(stream);
+  return new Uint8Array(await new Response(out).arrayBuffer());
+}
+async function readZip(buffer) {
+  const data = new DataView(buffer), bytes = new Uint8Array(buffer);
+  let end = bytes.length - 22;
+  while (end >= 0 && data.getUint32(end, true) !== 0x06054b50) end--;
+  if (end < 0) throw new FormError("This file could not be read. Save it again as .docx or .pptx and retry.");
+  const files = new Map();
+  let pos = data.getUint32(end + 16, true);
+  for (let i = 0; i < data.getUint16(end + 10, true); i++) {
+    const method = data.getUint16(pos + 10, true), size = data.getUint32(pos + 20, true);
+    const nameLen = data.getUint16(pos + 28, true), extraLen = data.getUint16(pos + 30, true), noteLen = data.getUint16(pos + 32, true);
+    const local = data.getUint32(pos + 42, true);
+    const name = new TextDecoder().decode(bytes.subarray(pos + 46, pos + 46 + nameLen));
+    files.set(name, { method, size, local });
+    pos += 46 + nameLen + extraLen + noteLen;
+  }
+  return {
+    has: name => files.has(name),
+    names: () => [...files.keys()],
+    async bytes(name) {
+      const f = files.get(name);
+      if (!f) throw new FormError(`The file is missing a part it needs (${name}).`);
+      const start = f.local + 30 + data.getUint16(f.local + 26, true) + data.getUint16(f.local + 28, true);
+      const raw = bytes.subarray(start, start + f.size);
+      return f.method === 0 ? raw : pipe(raw, new DecompressionStream("deflate-raw"));
+    },
+    async text(name) { return new TextDecoder().decode(await this.bytes(name)); },
+  };
+}
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b) { let c = 0xFFFFFFFF; for (const x of b) c = CRC[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+async function writeZip(entries) {
+  const parts = [], central = []; let offset = 0;
+  for (const [name, content] of entries) {
+    const raw = typeof content === "string" ? new TextEncoder().encode(content) : content;
+    const packed = await pipe(raw, new CompressionStream("deflate-raw"));
+    const nameBytes = new TextEncoder().encode(name), crc = crc32(raw);
+    const fields = v => { v.setUint16(0, 20, true); v.setUint16(2, 0x0800, true); v.setUint16(4, 8, true); v.setUint16(6, 0, true); v.setUint16(8, 0x5021, true);
+      v.setUint32(10, crc, true); v.setUint32(14, packed.length, true); v.setUint32(18, raw.length, true); v.setUint16(22, nameBytes.length, true); v.setUint16(24, 0, true); };
+    const head = new Uint8Array(30), hv = new DataView(head.buffer);
+    hv.setUint32(0, 0x04034b50, true); fields(new DataView(head.buffer, 4));
+    parts.push(head, nameBytes, packed);
+    const dir = new Uint8Array(46), dv = new DataView(dir.buffer);
+    dv.setUint32(0, 0x02014b50, true); dv.setUint16(4, 20, true); fields(new DataView(dir.buffer, 6)); dv.setUint32(42, offset, true);
+    central.push(dir, nameBytes);
+    offset += 30 + nameBytes.length + packed.length;
+  }
+  const size = central.reduce((n, p) => n + p.length, 0);
+  const end = new Uint8Array(22), ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true); ev.setUint16(8, entries.length, true); ev.setUint16(10, entries.length, true); ev.setUint32(12, size, true); ev.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end], { type:"application/zip" });
+}
+
+/* ---------- shared slide model ---------- */
+const textEl = (html, x, y, w, h) => ({ type:"text", html, x, y, w, h });
+const colourSpan = (text, colour) => colour ? `<span style="color: ${colour};">${text}</span>` : text;
+const heading = (text, colour = "#E64626") => textEl(`<h2>${colourSpan(esc(text), colour)}</h2>`, 2.5, 3.2, 92, 16.7);
+const parasHtml = (paras, colour) => paras.map(p => `<p>${colourSpan(esc(p), colour)}</p>`).join("");
+const listHtml = items => `<ul>${items.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`;
+
+function fitBox(image, x, y, w, h) {
+  if (!image.width || !image.height) return { x, y, w, h };
+  const boxW = w / 100 * SLIDE_W, boxH = h / 100 * SLIDE_H, scale = Math.min(boxW / image.width, boxH / image.height);
+  const newW = image.width * scale / SLIDE_W * 100, newH = image.height * scale / SLIDE_H * 100;
+  return { x: x + (w - newW) / 2, y: y + (h - newH) / 2, w: newW, h: newH };
+}
+
+function videoSource(url) {
+  const mime = /youtu\.?be/i.test(url) ? "video/YouTube" : /vimeo\.com/i.test(url) ? "video/Vimeo" : /panopto/i.test(url) ? "video/Panopto" : /\.webm(\?|$)/i.test(url) ? "video/webm" : "video/mp4";
+  return { path:url, mime, copyright:{ license:"U" } };
+}
+const findUrl = text => (String(text).match(/https?:\/\/[^\s]+/) || [null])[0];
+
+// In Drag Text, a colon inside the asterisks starts a tip, so it cannot stay in an answer.
+const dragAnswer = text => text.trim().replace(/\*/g, "").replace(/\s*:\s*/g, ", ");
+
+function buildQuestion(where, kind, rows) {
+  const value = label => { const r = rows.find(x => x.label.toLowerCase() === label); return r ? r.text.trim() : ""; };
+  const stem = value("question");
+  const ifCorrect = value("if correct"), ifIncorrect = value("if incorrect");
+  if (!stem) throw new FormError(`${where}: the Question row is empty.`);
+  if (!ifCorrect || !ifIncorrect) throw new FormError(`${where}: both the If correct and If incorrect rows are needed.`);
+  if (kind === "Multiple choice" || kind === "True/False") {
+    const options = rows.filter(r => /^[A-H]$/.test(r.label) && r.text.trim());
+    if (options.length < 2) throw new FormError(`${where}: at least two answer options are needed.`);
+    if (!options.some(o => o.correct)) throw new FormError(`${where}: no correct answer is marked. Add a tick (✓) to its label.`);
+    return { format:"mc", stem, shuffle: kind === "Multiple choice", ifCorrect, ifIncorrect, answers: options.map(o => ({ text:o.text.trim(), correct:o.correct })) };
+  }
+  let lines, extras = [];
+  if (kind === "Drag text") {
+    lines = value("sentence");
+    extras = value("extra words").split(",").map(s => s.trim()).filter(Boolean);
+    if (!/\*[^*]+\*/.test(lines)) throw new FormError(`${where}: the Sentence needs each answer wrapped in *asterisks*.`);
+  } else if (kind === "Put in order") {
+    const steps = rows.filter(r => /^Step \d+$/i.test(r.label) && r.text.trim());
+    if (steps.length < 2) throw new FormError(`${where}: at least two steps are needed.`);
+    lines = steps.map((s, i) => `${i + 1}. *${dragAnswer(s.text)}*`).join("\n");
+  } else {
+    const pairs = rows.filter(r => /^(Pair|Item) \d+$/i.test(r.label) && r.text.trim());
+    if (pairs.length < 2) throw new FormError(`${where}: at least two rows are needed.`);
+    lines = pairs.map(p => {
+      const [left, right] = p.text.split("→").map(s => s && s.trim());
+      if (!left || !right) throw new FormError(`${where}: "${p.text}" needs an arrow (→) between the two parts.`);
+      return `${left}: *${dragAnswer(right)}*`;
+    }).join("\n");
+  }
+  return { format:"drag", stem, lines, extras, ifCorrect, ifIncorrect };
+}
+
+/* ---------- Word form ---------- */
+async function readDocx(zip, notes) {
+  const doc = parseXml(await zip.text("word/document.xml"));
+  const relsName = "word/_rels/document.xml.rels";
+  const rels = zip.has(relsName) ? parseXml(await zip.text(relsName)) : null;
+  const cellText = tc => all(tc, "p").map(p => {
+    let s = ""; for (const n of all(p, "*")) { if (n.localName === "t") s += n.textContent; else if (n.localName === "tab" || n.localName === "br") s += " "; }
+    return s.trim();
+  }).filter(Boolean);
+  const pictureOf = async tc => {
+    const blip = all(tc, "blip")[0]; if (!blip || !rels) return null;
+    const rel = all(rels, "Relationship").find(r => r.getAttribute("Id") === relAttr(blip, "embed"));
+    if (!rel) return null;
+    return loadImage(zip, "word/" + rel.getAttribute("Target").replace(/^\/?word\//,"").replace(/^\.\//,""), all(tc, "docPr")[0]?.getAttribute("descr") || "", notes);
+  };
+  const slides = []; let lecture = null, videoUrl = null, found = 0;
+  for (const table of all(doc, "tbl")) {
+    const rows = kids(table, "tr").map(tr => kids(tr, "tc"));
+    if (!rows.length) continue;
+    const banner = cellText(rows[0][0]).join(" ");
+    const match = banner.match(/^Slide\s+(\d+)\s+(.*)$/);
+    const parsed = [];
+    for (const cells of rows.slice(match ? 1 : 0)) {
+      if (cells.length < 2) continue;
+      const raw = cellText(cells[0]).join(" ");
+      parsed.push({ label: raw.replace(/\s*✓\s*/,"").trim(), correct: raw.includes("✓"), paras: cellText(cells[1]), text: cellText(cells[1]).join(" "), cell: cells[1] });
+    }
+    const row = label => parsed.find(r => r.label.toLowerCase() === label);
+    if (!match) { // the details table above each lecturette
+      if (row("lecture code") && row("title")) {
+        lecture = row("title").text;
+        videoUrl = findUrl(row("video file")?.text || "");
+      }
+      continue;
+    }
+    found++;
+    const where = `Slide ${match[1]}`;
+    const kind = QUESTION_KINDS.find(k => match[2].trim().endsWith(k));
+    if (kind && /^Question\b/.test(match[2])) {
+      const qRows = parsed.map(r => ({ label:r.label, text:r.text, correct:r.correct }));
+      slides.push({ keyword: match[2].replace(kind,"").trim(), elements:[{ type:"question", q: buildQuestion(where, kind, qRows), x:3, y:3, w:94, h:94 }] });
+      continue;
+    }
+    const tag = SLIDE_TAGS.find(t => match[2].trim().endsWith(t));
+    if (!tag) throw new FormError(`${where}: the slide type in its blue header was not recognised. Keep the header as it was.`);
+    const title = match[2].trim().slice(0, -tag.length).trim();
+    const paras = row("content")?.paras || [];
+    const image = row("image / visual") ? await pictureOf(row("image / visual").cell) : null;
+    const lectureNo = (title.match(/Lecturette (\d+)/) || [])[1];
+    const lectureTitle = lecture && lectureNo ? `Lecturette ${lectureNo}: ${lecture}` : title;
+    let elements = [], background = null;
+    if (tag === "Title") {
+      background = COLOURS.red;
+      elements = [textEl(`<h2>${colourSpan(esc(title),"#ffffff")}</h2>${parasHtml(row("subtitle")?.paras || [],"#ffffff")}`, 8, 30, 84, 40)];
+    } else if (tag === "Hook" || tag === "Close" || tag === "Segue") {
+      background = tag === "Hook" ? COLOURS.gold : tag === "Close" ? COLOURS.charcoal : COLOURS.blue;
+      const colour = tag === "Hook" ? "#000000" : "#ffffff", shown = tag === "Segue" ? lectureTitle : title;
+      elements = [textEl(`<h2>${colourSpan(esc(shown), colour)}</h2>`, 4, 26, 40, 40), textEl(parasHtml(paras, colour), 50, 14, 45, 72)];
+    } else if (tag === "Video") {
+      const url = findUrl(row("video")?.text || "") || videoUrl;
+      elements = [heading(lectureTitle)];
+      if (url) elements.push({ type:"video", url, x:20, y:18.5, w:60, h:60 });
+      else { elements.push(textEl(`<p>${esc("Video to be added: " + lecture)}</p>`, 20, 40, 60, 14)); notes.video++; }
+      if (row("caption")?.text) elements.push(textEl(parasHtml(row("caption").paras), 5, 80, 90, 13));
+    } else if (tag === "Summary") {
+      elements = [heading(title), textEl(listHtml(paras), 5, 20, 90, 70)];
+    } else if (tag === "Contents") {
+      elements = [heading(title), textEl(parasHtml(paras), 5, 20, 90, 72)];
+    } else {
+      elements = [heading(title)];
+      if (image) elements.push(textEl(parasHtml(paras), 51, 20, 44, 68), { type:"image", image, ...fitBox(image, 5, 20, 44, 62) });
+      else { elements.push(textEl(parasHtml(paras), 5, 20, 90, 68)); notes.image++; }
+    }
+    slides.push({ keyword: tag === "Segue" || tag === "Video" ? (tag === "Video" ? "Video " : "Outcomes ") + (lectureNo || "") : title, background, elements });
+  }
+  if (!found) throw new FormError("No slide tables were found. Use the lesson form, and keep the blue slide headers.");
+  return slides;
+}
+
+/* ---------- PowerPoint form ---------- */
+const resolvePath = (base, target) => {
+  if (target.startsWith("/")) return target.slice(1);
+  const parts = base.split("/").slice(0, -1);
+  for (const piece of target.split("/")) { if (piece === "..") parts.pop(); else if (piece !== ".") parts.push(piece); }
+  return parts.join("/");
+};
+async function relsOf(zip, part) {
+  const name = part.replace(/([^/]+)$/, "_rels/$1.rels"), map = new Map();
+  if (!zip.has(name)) return map;
+  for (const r of all(parseXml(await zip.text(name)), "Relationship"))
+    map.set(r.getAttribute("Id"), { type:r.getAttribute("Type"), target:r.getAttribute("Target"), external:r.getAttribute("TargetMode") === "External" });
+  return map;
+}
+function phOf(shape) { return all(shape, "ph")[0] || null; }
+function geometry(shape) {
+  const xfrm = all(shape, "xfrm")[0]; if (!xfrm) return null;
+  const off = kids(xfrm, "off")[0], ext = kids(xfrm, "ext")[0];
+  if (!off || !ext) return null;
+  return { x:+off.getAttribute("x"), y:+off.getAttribute("y"), w:+ext.getAttribute("cx"), h:+ext.getAttribute("cy") };
+}
+function inherited(ph, parts) {
+  const type = ph.getAttribute("type") || "body", idx = ph.getAttribute("idx");
+  for (const tree of parts) for (const sp of all(tree, "sp")) {
+    const other = phOf(sp); if (!other) continue;
+    const otherType = other.getAttribute("type") || "body";
+    if ((idx && other.getAttribute("idx") === idx) || (otherType === type && (!idx || tree === parts[parts.length - 1]))) { const g = geometry(sp); if (g) return g; }
+  }
+  return null;
+}
+function shapeText(sp, defaultColour) {
+  const body = all(sp, "txBody")[0]; if (!body) return { html:"", plain:"" };
+  let html = "", list = [], plain = [];
+  const flush = () => { if (list.length) { html += `<ul>${list.join("")}</ul>`; list = []; } };
+  for (const p of kids(body, "p")) {
+    let line = "", raw = "";
+    for (const r of kids(p, "r").concat(kids(p, "fld"))) {
+      const t = all(r, "t")[0]?.textContent || ""; if (!t) continue;
+      raw += t;
+      const rpr = kids(r, "rPr")[0];
+      const colourEl = rpr && kids(rpr, "solidFill")[0] && kids(kids(rpr, "solidFill")[0], "srgbClr")[0];
+      const colour = colourEl ? "#" + colourEl.getAttribute("val") : defaultColour;
+      let piece = esc(t);
+      if (rpr?.getAttribute("b") === "1") piece = `<strong>${piece}</strong>`;
+      line += colourSpan(piece, colour);
+    }
+    if (!raw.trim()) continue;
+    plain.push(raw);
+    const ppr = kids(p, "pPr")[0];
+    if (ppr && kids(ppr, "buChar").length) list.push(`<li>${line}</li>`);
+    else { flush(); html += `<p>${line}</p>`; }
+  }
+  flush();
+  return { html, plain: plain.join(" ") };
+}
+async function readPptx(zip, notes) {
+  const presName = "ppt/presentation.xml", presRels = await relsOf(zip, presName);
+  const size = all(parseXml(await zip.text(presName)), "sldSz")[0];
+  const width = +size?.getAttribute("cx") || SLIDE_W, height = +size?.getAttribute("cy") || SLIDE_H;
+  const pct = g => ({ x:g.x / width * 100, y:g.y / height * 100, w:g.w / width * 100, h:g.h / height * 100 });
+  const ids = all(parseXml(await zip.text(presName)), "sldId");
+  const slides = [];
+  for (let i = 0; i < ids.length; i++) {
+    const where = `Slide ${i + 1}`;
+    const part = resolvePath(presName, presRels.get(relAttr(ids[i], "id")).target);
+    const xml = parseXml(await zip.text(part)), rels = await relsOf(zip, part);
+    const layoutRel = [...rels.values()].find(r => r.type.endsWith("/slideLayout"));
+    const layoutPart = layoutRel ? resolvePath(part, layoutRel.target) : null;
+    const layoutXml = layoutPart ? parseXml(await zip.text(layoutPart)) : null;
+    const layoutRels = layoutPart ? await relsOf(zip, layoutPart) : new Map();
+    const masterRel = [...layoutRels.values()].find(r => r.type.endsWith("/slideMaster"));
+    const masterXml = masterRel ? parseXml(await zip.text(resolvePath(layoutPart, masterRel.target))) : null;
+    const trees = [layoutXml, masterXml].filter(Boolean);
+    const layoutName = layoutXml ? (all(layoutXml, "cSld")[0]?.getAttribute("name") || "") : "";
+    const background = /blue/i.test(layoutName) ? COLOURS.blue : /gold/i.test(layoutName) ? COLOURS.gold : /charcoal/i.test(layoutName) ? COLOURS.charcoal : /red/i.test(layoutName) ? COLOURS.red : null;
+    const onDark = background && background !== COLOURS.gold;
+    const elements = []; let keyword = "", title = "";
+    const tree = all(xml, "spTree")[0];
+    for (const shape of [...tree.children]) {
+      const name = kids(shape, "nvSpPr").concat(kids(shape, "nvPicPr"), kids(shape, "nvGraphicFramePr"))[0];
+      const label = name ? all(name, "cNvPr")[0]?.getAttribute("name") || "" : "";
+      if (shape.localName === "sp") {
+        const ph = phOf(shape);
+        const isTitle = ph && /title/i.test(ph.getAttribute("type") || "");
+        const defaultColour = onDark ? "#ffffff" : isTitle && !background ? "#E64626" : background === COLOURS.gold ? "#000000" : null;
+        if (/^IMAGE\b/i.test(label)) { notes.image++; continue; }
+        const content = shapeText(shape, defaultColour);
+        const g = geometry(shape) || (ph ? inherited(ph, trees) : null);
+        if (/^VIDEO\b/i.test(label)) {
+          const link = all(shape, "hlinkClick")[0];
+          const linked = link ? rels.get(relAttr(link, "id")) : null;
+          const url = findUrl(content.plain) || (linked && linked.external ? linked.target : null);
+          if (url && g) elements.push({ type:"video", url, ...pct(g) });
+          else { notes.video++; if (g) elements.push(textEl(`<p>${esc("Video to be added")}</p>`, 20, 40, 60, 14)); }
+          continue;
+        }
+        if (!content.plain.trim()) continue;
+        if (!g) { notes.other.push(`${where}: "${content.plain.slice(0,40)}" has no position, so it was placed at the top.`); }
+        const box = g ? pct(g) : { x:5, y:20, w:90, h:60 };
+        const html = isTitle ? `<h2>${content.html.replace(/<\/?p>/g,"")}</h2>` : content.html;
+        if (isTitle) title = content.plain;
+        elements.push(textEl(html, box.x, box.y, box.w, box.h));
+      } else if (shape.localName === "pic") {
+        const blip = all(shape, "blip")[0], g = geometry(kids(shape, "spPr")[0] || shape);
+        const rel = blip ? rels.get(relAttr(blip, "embed")) : null;
+        if (!rel || !g) { notes.other.push(`${where}: a picture could not be read and was left out.`); continue; }
+        const image = await loadImage(zip, resolvePath(part, rel.target), all(shape, "cNvPr")[0]?.getAttribute("descr") || "", notes);
+        if (image) elements.push({ type:"image", image, ...pct(g) });
+      } else if (shape.localName === "graphicFrame") {
+        const rows = all(shape, "tr").map(tr => kids(tr, "tc").map(tc => all(tc, "t").map(t => t.textContent).join("")));
+        const head = rows[0]?.[0] || "", match = head.match(/^Question\s+([\d.]+):\s*(.+)$/);
+        if (!match) { notes.other.push(`${where}: a table that is not a question was left out.`); continue; }
+        const kind = QUESTION_KINDS.find(k => k.toLowerCase() === match[2].trim().toLowerCase());
+        if (!kind) throw new FormError(`${where}: the question type "${match[2]}" was not recognised.`);
+        const qRows = rows.slice(1).map(r => ({ label:(r[0] || "").replace(/\s*✓\s*/,"").trim(), correct:(r[0] || "").includes("✓"), text:r[1] || "" }));
+        elements.length = 0;
+        elements.push({ type:"question", q: buildQuestion(where, kind, qRows), x:3, y:3, w:94, h:94 });
+        keyword = `Question ${match[1]}`;
+      } else if (shape.localName === "grpSp") {
+        notes.other.push(`${where}: a grouped object was left out. Ungroup it and convert again.`);
+      }
+    }
+    if (elements.length) slides.push({ keyword: keyword || title || where, background, elements });
+    else notes.other.push(`${where}: nothing to convert, so it was skipped.`);
+  }
+  if (!slides.length) throw new FormError("No slides were found in this file.");
+  return slides;
+}
+
+/* ---------- images ---------- */
+async function loadImage(zip, path, alt, notes) {
+  const ext = (path.split(".").pop() || "").toLowerCase();
+  const mime = { png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg", gif:"image/gif" }[ext];
+  if (!mime || !zip.has(path)) { notes.other.push(`A .${ext} picture was left out. Use PNG or JPG.`); return null; }
+  const bytes = await zip.bytes(path); let width = 0, height = 0;
+  try { const bitmap = await createImageBitmap(new Blob([bytes], { type:mime })); width = bitmap.width; height = bitmap.height; bitmap.close(); } catch (e) {}
+  if (!alt) notes.alt++;
+  return { bytes:new Uint8Array(bytes), ext, mime, alt, width, height };
+}
+
+/* ---------- H5P output ---------- */
+function action(library, params, contentType, title) {
+  return { library, params, subContentId:uuid(), metadata:{ contentType, license:"U", title:title || contentType } };
+}
+function questionAction(q, used) {
+  const wrap = t => `<div>${esc(t)}</div>`;
+  if (q.format === "mc") {
+    used.add(LIB.mc);
+    return action(LIB.mc, {
+      question:`<p>${esc(q.stem)}</p>`,
+      answers:q.answers.map(a => ({ text:wrap(a.text), correct:a.correct, tipsAndFeedback:{ tip:"", chosenFeedback:wrap(a.correct ? q.ifCorrect : q.ifIncorrect), notChosenFeedback:"" } })),
+      overallFeedback:[{ from:0, to:100 }],
+      behaviour:{ enableRetry:true, enableSolutionsButton:true, enableCheckButton:true, type:"auto", singlePoint:false, randomAnswers:q.shuffle, showSolutionsRequiresInput:true, confirmCheckDialog:false, confirmRetryDialog:false, autoCheck:false, passPercentage:100, showScorePoints:true },
+      media:{ disableImageZooming:false },
+    }, "Multiple Choice", q.stem.slice(0,60));
+  }
+  used.add(LIB.drag);
+  return action(LIB.drag, {
+    taskDescription:`<p>${esc(q.stem)}</p>`, textField:q.lines,
+    distractors:q.extras.map(w => `*${w}*`).join("\n"),
+    overallFeedback:[{ from:0, to:99, feedback:q.ifIncorrect }, { from:100, to:100, feedback:q.ifCorrect }],
+    behaviour:{ enableRetry:true, enableSolutionsButton:true, enableCheckButton:true, instantFeedback:false },
+  }, "Drag the Words", q.stem.slice(0,60));
+}
+async function buildH5P(slides, title) {
+  const used = new Set([LIB.cp]), media = []; let questions = 0;
+  const out = slides.map(slide => {
+    const elements = slide.elements.map(el => {
+      let act;
+      if (el.type === "text") { used.add(LIB.text); act = action(LIB.text, { text:el.html }, "Text"); }
+      else if (el.type === "question") { questions++; act = questionAction(el.q, used); }
+      else if (el.type === "video") {
+        used.add(LIB.video);
+        act = action(LIB.video, { visuals:{ fit:true, controls:true }, playback:{ autoplay:false, loop:false }, sources:[videoSource(el.url)] }, "Video");
+      } else {
+        used.add(LIB.image);
+        const path = `images/image${media.length + 1}.${el.image.ext}`;
+        media.push([`content/${path}`, el.image.bytes]);
+        const file = { path, mime:el.image.mime, copyright:{ license:"U" } };
+        if (el.image.width) { file.width = el.image.width; file.height = el.image.height; }
+        act = action(LIB.image, { contentName:"Image", file, alt:el.image.alt || "Image", decorative:false }, "Image", el.image.alt);
+      }
+      const round = n => Math.round(n * 100) / 100;
+      return { x:round(el.x), y:round(el.y), width:round(el.w), height:round(el.h), action:act, alwaysDisplayComments:false, backgroundOpacity:0, displayAsButton:false, buttonSize:"big", goToSlideType:"specified", invisible:false, solution:"" };
+    });
+    return { elements, keywords:[{ main:slide.keyword || "Slide" }], slideBackgroundSelector: slide.background ? { fillSlideBackground:slide.background } : {} };
+  });
+  const content = {
+    presentation:{ slides:out, keywordListEnabled:true, globalBackgroundSelector:{}, keywordListAlwaysShow:false, keywordListAutoHide:false, keywordListOpacity:90 },
+    override:{ activeSurface:false, hideSummarySlide:false, summarySlideSolutionButton:true, summarySlideRetryButton:true, enablePrintButton:false },
+  };
+  const manifest = {
+    title, language:"en", mainLibrary:"H5P.CoursePresentation", embedTypes:["iframe"], license:"U",
+    preloadedDependencies:[...used].sort().map(lib => { const [machineName, version] = lib.split(" "), [majorVersion, minorVersion] = version.split("."); return { machineName, majorVersion, minorVersion }; }),
+  };
+  const blob = await writeZip([["h5p.json", JSON.stringify(manifest)], ["content/content.json", JSON.stringify(content)], ...media]);
+  return { blob, questions, images:media.length, content, manifest };
+}
+
+/* ---------- page ---------- */
+async function convert(buffer, fileName) {
+  const ext = fileName.split(".").pop().toLowerCase();
+  if (ext !== "docx" && ext !== "pptx") throw new FormError("Choose a .docx or .pptx file.");
+  const zip = await readZip(buffer), notes = { image:0, video:0, alt:0, other:[] };
+  const slides = ext === "docx" ? await readDocx(zip, notes) : await readPptx(zip, notes);
+  const title = fileName.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ");
+  const built = await buildH5P(slides, title);
+  return { ...built, slides:slides.length, notes, name:fileName.replace(/\.[^.]+$/, "") + ".h5p" };
+}
+window.convertToH5P = convert;
+
+const result = document.getElementById("result");
+function show(file) {
+  result.innerHTML = `<p class="muted">Converting ${esc(file.name)}...</p>`;
+  file.arrayBuffer().then(buffer => convert(buffer, file.name)).then(done => {
+    const url = URL.createObjectURL(done.blob), link = document.createElement("a");
+    link.href = url; link.download = done.name; link.click();
+    const remarks = [];
+    if (done.notes.video) remarks.push(`${done.notes.video} video slide${done.notes.video > 1 ? "s have" : " has"} no link yet. Add the videos in H5P, or add links to your form and convert again.`);
+    if (done.notes.image) remarks.push(`${done.notes.image} image placeholder${done.notes.image > 1 ? "s were" : " was"} left out because no picture has been added.`);
+    if (done.notes.alt) remarks.push(`${done.notes.alt} picture${done.notes.alt > 1 ? "s have" : " has"} no alt text.`);
+    remarks.push(...done.notes.other);
+    result.innerHTML = `<p class="ok">Done: ${esc(done.name)}</p><p>${done.slides} slides, ${done.questions} questions, ${done.images} pictures. It should be in your Downloads folder.</p>`
+      + `<p><a id="again" href="${url}" download="${esc(done.name)}">Download it again</a></p>`
+      + (remarks.length ? `<p><strong>Worth checking:</strong></p><ul>${remarks.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : "");
+  }).catch(error => {
+    const message = error instanceof FormError ? error.message : `Something went wrong: ${error.message}`;
+    result.innerHTML = `<p class="bad">Could not convert this file.</p><p>${esc(message)}</p>`;
+  });
+}
+const drop = document.getElementById("drop"), input = document.getElementById("file");
+input.addEventListener("change", () => { if (input.files[0]) show(input.files[0]); input.value = ""; });
+["dragenter","dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => { if (e.dataTransfer.files[0]) show(e.dataTransfer.files[0]); });
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+</script>
+</body>
+</html>
