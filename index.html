@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Convert to H5P</title>
+<title>Word and PowerPoint to H5P Converter</title>
+<meta name="description" content="Free browser tool that turns a Word or PowerPoint lesson form into an H5P Course Presentation. Files are converted on your own computer and are not uploaded.">
 <style>
   :root { --ink:#1f2933; --muted:#595959; --blue:#0148A4; --tint:#EDF2F9; --line:#BFBFBF; --bg:#ffffff; --bad:#B3261E; --ok:#2E7D32; }
   @media (prefers-color-scheme: dark) {
@@ -24,18 +25,52 @@
   .bad { color:var(--bad); font-weight:700; }
   .ok { color:var(--ok); font-weight:700; }
   ul { margin:6px 0 16px; padding-left:22px; }
+  #about, #tips { margin-top:32px; padding-top:24px; border-top:1px solid var(--line); }
+  h2 { margin:24px 0 8px; color:var(--blue); font-size:22px; }
+  #about h2, #tips h2 { margin-top:0; }
+  .buttons { display:flex; flex-wrap:wrap; gap:10px; }
+  a.button { display:inline-block; color:#fff; background:#0148A4; font-weight:700; text-decoration:none; border-radius:6px; padding:10px 18px; }
+  #tips li { margin-bottom:6px; }
+  a { color:var(--blue); }
 </style>
 </head>
 <body>
 <main>
-  <h1>Convert to H5P</h1>
-  <p class="muted">Turns a completed Word or PowerPoint lesson form into an H5P Course Presentation. Your file stays on this computer.</p>
+  <h1>Word and PowerPoint to H5P Converter</h1>
+  <p class="muted">Build an H5P Course Presentation from a Word or PowerPoint form, in three steps. Your file stays on your computer.</p>
+  <h2>Step 1: Download a template</h2>
+  <p>Choose whichever you prefer. Both give you the same lesson structure, and PowerPoint gives you more control over how slides look.</p>
+  <p class="buttons">
+    <a class="button" href="https://petermcdonald8.github.io/h5p-converter/H5P-lesson-form_template.docx" download>Word template</a>
+    <a class="button" href="https://petermcdonald8.github.io/h5p-converter/H5P-lesson-form_template.pptx" download>PowerPoint template</a>
+  </p>
+  <p class="muted">Keep an eye on this page. I'll keep refreshing the templates with new styles and layouts.</p>
+  <h2>Step 2: Fill it in and save it</h2>
+  <p>Replace the sample text and add your pictures. You can copy, move or delete slides. For each answer, use the Correct or Wrong label to mark it.</p>
+  <h2>Step 3: Convert it</h2>
+  <p>Drop your saved template into the box below. Your H5P file will download, ready to upload to H5P, where you can also add your videos.</p>
   <label id="drop">
     <strong>Drop your .docx or .pptx here</strong>
     <span class="muted">or click to choose a file</span>
     <input id="file" type="file" accept=".docx,.pptx">
   </label>
   <div id="result" aria-live="polite"></div>
+  <section id="tips">
+    <h2>Good to know</h2>
+    <ul>
+      <li>The converter only reads these templates, not ordinary documents or slide decks.</li>
+      <li>In PowerPoint, text size, colour, bold, italics and underline carry across, though sizes may look slightly different in H5P.</li>
+      <li>To change a PowerPoint slide's colour, use Format Background and choose a solid fill. On a coloured slide, also tick Hide Background Graphics.</li>
+      <li>In Word, only the words and pictures are used.</li>
+    </ul>
+  </section>
+  <section id="about">
+    <h2>Built by an educator, for education</h2>
+    <p>I'd love to hear how you are using this tool in your teaching, and how effective it has been for your students. I'm keen to hear from other educators and to collaborate on education-focused research. If that sounds like you, please get in touch at <a href="mailto:peter.mcdonald1@sydney.edu.au">peter.mcdonald1@sydney.edu.au</a>.</p>
+    <p>I built this to make H5P content quicker to create, and I'm very interested in how interactive online learning supports students.</p>
+    <p><a href="https://profiles.sydney.edu.au/peter.mcdonald1/about" target="_blank" rel="noopener">Dr Peter McDonald</a></p>
+    <p class="muted">This is an independent tool, not an official University of Sydney or H5P product.</p>
+  </section>
 </main>
 <script>
 "use strict";
@@ -143,10 +178,12 @@ function buildQuestion(where, kind, rows) {
   if (!stem) throw new FormError(`${where}: the Question row is empty.`);
   if (!ifCorrect || !ifIncorrect) throw new FormError(`${where}: both the If correct and If incorrect rows are needed.`);
   if (kind === "Multiple choice" || kind === "True/False") {
-    const options = rows.filter(r => /^[A-H]$/.test(r.label) && r.text.trim());
+    // New forms label each row Correct or Wrong. Older forms use letters with a tick.
+    const isCorrect = r => r.correct || /^correct( answer)?$/i.test(r.label);
+    const options = rows.filter(r => /^([A-H]|correct( answer)?|(wrong|incorrect)( answer)?)$/i.test(r.label) && r.text.trim());
     if (options.length < 2) throw new FormError(`${where}: at least two answer options are needed.`);
-    if (!options.some(o => o.correct)) throw new FormError(`${where}: no correct answer is marked. Add a tick (✓) to its label.`);
-    return { format:"mc", stem, shuffle: kind === "Multiple choice", ifCorrect, ifIncorrect, answers: options.map(o => ({ text:o.text.trim(), correct:o.correct })) };
+    if (!options.some(isCorrect)) throw new FormError(`${where}: no answer is marked as correct. Change a row's label to Correct.`);
+    return { format:"mc", stem, shuffle: kind === "Multiple choice", ifCorrect, ifIncorrect, answers: options.map(o => ({ text:o.text.trim(), correct:isCorrect(o) })) };
   }
   let lines, extras = [];
   if (kind === "Drag text") {
@@ -278,7 +315,50 @@ function inherited(ph, parts) {
   }
   return null;
 }
-function shapeText(sp, defaultColour) {
+/* Colours: custom colours, theme palette colours and their lighter or darker variants */
+function readThemeColours(xml) {
+  const map = new Map(), scheme = all(xml, "clrScheme")[0];
+  if (!scheme) return map;
+  for (const entry of [...scheme.children]) {
+    const value = entry.children[0];
+    if (value) map.set(entry.localName, (value.getAttribute("lastClr") || value.getAttribute("val") || "").toUpperCase());
+  }
+  return map;
+}
+function rgbToHsl(hex) {
+  const [r, g, b] = [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+  if (!d) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const h = (max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4) / 6;
+  return [h, s, l];
+}
+function hslToRgb(h, s, l) {
+  const channel = n => { const k = (n + h * 12) % 12, a = s * Math.min(l, 1 - l);
+    return Math.round((l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))) * 255).toString(16).padStart(2, "0"); };
+  return (channel(0) + channel(8) + channel(4)).toUpperCase();
+}
+function resolveColour(fill, theme) {
+  const source = fill && [...fill.children].find(c => ["srgbClr", "schemeClr", "sysClr"].includes(c.localName));
+  if (!source) return null;
+  const aliases = { tx1:"dk1", bg1:"lt1", tx2:"dk2", bg2:"lt2" };
+  let hex = source.localName === "srgbClr" ? source.getAttribute("val")
+    : source.localName === "sysClr" ? source.getAttribute("lastClr")
+    : theme.get(aliases[source.getAttribute("val")] || source.getAttribute("val"));
+  if (!/^[0-9a-f]{6}$/i.test(hex || "")) return null;
+  const mod = name => { const el = kids(source, name)[0]; return el ? +el.getAttribute("val") / 100000 : null; };
+  const lumMod = mod("lumMod"), lumOff = mod("lumOff");
+  if (lumMod !== null || lumOff !== null) {
+    const [h, s, l] = rgbToHsl(hex);
+    hex = hslToRgb(h, s, Math.min(1, l * (lumMod ?? 1) + (lumOff ?? 0)));
+  }
+  return "#" + hex.toUpperCase();
+}
+const isDark = colour => { const n = parseInt(colour.slice(1), 16); return 0.299 * (n >> 16) + 0.587 * (n >> 8 & 255) + 0.114 * (n & 255) < 150; };
+// On a slide, the converter treats 18 pt as the normal text size.
+const sizeSpan = (html, hundredths) => hundredths ? `<span style="font-size: ${Math.round(hundredths / 18) / 100}em;">${html}</span>` : html;
+
+function shapeText(sp, defaultColour, theme) {
   const body = all(sp, "txBody")[0]; if (!body) return { html:"", plain:"" };
   let html = "", list = [], plain = [];
   const flush = () => { if (list.length) { html += `<ul>${list.join("")}</ul>`; list = []; } };
@@ -288,11 +368,13 @@ function shapeText(sp, defaultColour) {
       const t = all(r, "t")[0]?.textContent || ""; if (!t) continue;
       raw += t;
       const rpr = kids(r, "rPr")[0];
-      const colourEl = rpr && kids(rpr, "solidFill")[0] && kids(kids(rpr, "solidFill")[0], "srgbClr")[0];
-      const colour = colourEl ? "#" + colourEl.getAttribute("val") : defaultColour;
+      const colour = (rpr && resolveColour(kids(rpr, "solidFill")[0], theme)) || defaultColour;
+      const underline = rpr?.getAttribute("u");
       let piece = esc(t);
       if (rpr?.getAttribute("b") === "1") piece = `<strong>${piece}</strong>`;
-      line += colourSpan(piece, colour);
+      if (rpr?.getAttribute("i") === "1") piece = `<em>${piece}</em>`;
+      if (underline && underline !== "none") piece = `<u>${piece}</u>`;
+      line += sizeSpan(colourSpan(piece, colour), +rpr?.getAttribute("sz") || 0);
     }
     if (!raw.trim()) continue;
     plain.push(raw);
@@ -319,11 +401,18 @@ async function readPptx(zip, notes) {
     const layoutXml = layoutPart ? parseXml(await zip.text(layoutPart)) : null;
     const layoutRels = layoutPart ? await relsOf(zip, layoutPart) : new Map();
     const masterRel = [...layoutRels.values()].find(r => r.type.endsWith("/slideMaster"));
-    const masterXml = masterRel ? parseXml(await zip.text(resolvePath(layoutPart, masterRel.target))) : null;
+    const masterPart = masterRel ? resolvePath(layoutPart, masterRel.target) : null;
+    const masterXml = masterPart ? parseXml(await zip.text(masterPart)) : null;
+    const themeRel = masterPart ? [...(await relsOf(zip, masterPart)).values()].find(r => r.type.endsWith("/theme")) : null;
+    const theme = themeRel ? readThemeColours(parseXml(await zip.text(resolvePath(masterPart, themeRel.target)))) : new Map();
     const trees = [layoutXml, masterXml].filter(Boolean);
     const layoutName = layoutXml ? (all(layoutXml, "cSld")[0]?.getAttribute("name") || "") : "";
-    const background = /blue/i.test(layoutName) ? COLOURS.blue : /gold/i.test(layoutName) ? COLOURS.gold : /charcoal/i.test(layoutName) ? COLOURS.charcoal : /red/i.test(layoutName) ? COLOURS.red : null;
-    const onDark = background && background !== COLOURS.gold;
+    const layoutColour = /blue/i.test(layoutName) ? COLOURS.blue : /gold/i.test(layoutName) ? COLOURS.gold : /charcoal/i.test(layoutName) ? COLOURS.charcoal : /red/i.test(layoutName) ? COLOURS.red : null;
+    // A colour set on the slide itself takes priority over its layout.
+    const slideBg = kids(all(xml, "cSld")[0], "bg")[0];
+    const slideFill = slideBg && kids(slideBg, "bgPr")[0] ? kids(kids(slideBg, "bgPr")[0], "solidFill")[0] : null;
+    const background = resolveColour(slideFill, theme) || layoutColour;
+    const onDark = background && isDark(background);
     const elements = []; let keyword = "", title = "";
     const tree = all(xml, "spTree")[0];
     for (const shape of [...tree.children]) {
@@ -332,9 +421,9 @@ async function readPptx(zip, notes) {
       if (shape.localName === "sp") {
         const ph = phOf(shape);
         const isTitle = ph && /title/i.test(ph.getAttribute("type") || "");
-        const defaultColour = onDark ? "#ffffff" : isTitle && !background ? "#E64626" : background === COLOURS.gold ? "#000000" : null;
+        const defaultColour = onDark ? "#ffffff" : isTitle && !background ? "#E64626" : background ? "#000000" : null;
         if (/^IMAGE\b/i.test(label)) { notes.image++; continue; }
-        const content = shapeText(shape, defaultColour);
+        const content = shapeText(shape, defaultColour, theme);
         const g = geometry(shape) || (ph ? inherited(ph, trees) : null);
         if (/^VIDEO\b/i.test(label)) {
           const link = all(shape, "hlinkClick")[0];
@@ -347,7 +436,9 @@ async function readPptx(zip, notes) {
         if (!content.plain.trim()) continue;
         if (!g) { notes.other.push(`${where}: "${content.plain.slice(0,40)}" has no position, so it was placed at the top.`); }
         const box = g ? pct(g) : { x:5, y:20, w:90, h:60 };
-        const html = isTitle ? `<h2>${content.html.replace(/<\/?p>/g,"")}</h2>` : content.html;
+        // A heading would multiply a set size, so sized titles use bold text instead.
+        const titleText = content.html.replace(/<\/?p>/g,"");
+        const html = !isTitle ? content.html : titleText.includes("font-size") ? `<p><strong>${titleText}</strong></p>` : `<h2>${titleText}</h2>`;
         if (isTitle) title = content.plain;
         elements.push(textEl(html, box.x, box.y, box.w, box.h));
       } else if (shape.localName === "pic") {
